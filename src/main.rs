@@ -1,13 +1,15 @@
 use std::{
-    io::SeekFrom,
+    io::{BufRead, BufReader},
+    process::exit,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
 };
 
+use eyre::eyre;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use regex::Regex;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -43,20 +45,13 @@ impl BuildWatcher {
         let p_denom = Arc::clone(&progress_denom);
 
         tokio::spawn(async move {
-            /*/
-                let mut file = tokio::fs::File::open("/var/log/emerge.log")
-                    .await
-                    .expect("failed to open log file");
-                file.seek(SeekFrom::End(0))
-                    .await
-                    .expect("failed to seek to end of file");
-                let mut reader = tokio::io::BufReader::new(file);
-
-                Self::tail_follow(&mut reader, |line| {
-                    Self::parse_progress(line, Arc::clone(&p_num), Arc::clone(&p_denom));
-                })
-                .await;
-            */
+            let mut reader = Self::spawn_emerge_process()
+                .await
+                .expect("failed to spawn emerge process");
+            Self::tail_follow(&mut reader, |line| {
+                Self::parse_progress(line, Arc::clone(&p_num), Arc::clone(&p_denom));
+            })
+            .await;
         });
 
         Ok(Self {
@@ -86,27 +81,66 @@ impl BuildWatcher {
         }
     }
 
-    async fn tail_follow<T: AsyncBufReadExt + Unpin>(
-        reader: &mut T,
+    async fn tail_follow(
+        tx: &mut tokio::sync::broadcast::Sender<String>,
         mut on_line: impl FnMut(&str),
     ) {
+        let mut rx = tx.subscribe();
         let mut line = String::new();
 
         loop {
             line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            match rx.recv().await {
+                Ok(msg) => {
+                    on_line(&msg);
                 }
-                Ok(_) => {
-                    on_line(line.trim_end());
-                }
-                Err(e) => {
-                    eprintln!("Error reading file: {}", e);
+                Err(_) => {
                     break;
                 }
             }
         }
+    }
+
+    async fn spawn_emerge_process() -> eyre::Result<tokio::sync::broadcast::Sender<String>> {
+        let pty_system = native_pty_system();
+
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| eyre!("failed to open pty: {e}"))?;
+
+        let mut cmd = CommandBuilder::new("emerge");
+        cmd.args(["-avuDN", "@world"]);
+
+        pair.slave
+            .spawn_command(cmd)
+            .map_err(|e| eyre!("failed to spawn command in pty: {e}"))?;
+
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| eyre!("failed to clone pty reader: {e}"))?;
+
+        let (tx, _) = tokio::sync::broadcast::channel(4);
+        let tx_clone = tx.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let reader = BufReader::new(reader);
+            let mut lines = reader.lines();
+            while let Some(Ok(line)) = lines.next() {
+                println!("{}", line);
+                if tx_clone.send(line).is_err() {
+                    println!("Receiver dropped, exiting...");
+                    exit(0);
+                }
+            }
+        });
+
+        Ok(tx)
     }
 }
 
