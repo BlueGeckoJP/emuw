@@ -1,4 +1,5 @@
 use std::{
+    cmp::min,
     io::{BufRead, BufReader},
     process::exit,
     sync::{
@@ -8,25 +9,25 @@ use std::{
 };
 
 use eyre::eyre;
+use indicatif::ProgressBar;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use regex::Regex;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    let build_watcher = BuildWatcher::new().await?;
+    let progress_bar = ProgressBar::new(100);
+    let build_watcher = BuildWatcher::new(progress_bar.clone()).await?;
 
     loop {
         let num = build_watcher.progress_num.load(Ordering::SeqCst);
         let denom = build_watcher.progress_denom.load(Ordering::SeqCst);
         if denom > 0 {
-            println!(
-                "Progress: {}/{} ({:.2}%)",
-                num,
-                denom,
-                (num as f64 / denom as f64) * 100.0
-            );
+            let normalized_denom = 100;
+            let normalized_num = (num * normalized_denom) / denom;
+            let clamped_num = min(normalized_num, normalized_denom);
+            progress_bar.set_position(clamped_num as u64);
         } else {
-            println!("Progress: N/A");
+            progress_bar.set_position(0);
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
@@ -38,14 +39,14 @@ struct BuildWatcher {
 }
 
 impl BuildWatcher {
-    async fn new() -> eyre::Result<Self> {
+    async fn new(progress_bar: ProgressBar) -> eyre::Result<Self> {
         let progress_num = Arc::new(AtomicU32::new(0));
         let progress_denom = Arc::new(AtomicU32::new(0));
         let p_num = Arc::clone(&progress_num);
         let p_denom = Arc::clone(&progress_denom);
 
         tokio::spawn(async move {
-            let mut reader = Self::spawn_emerge_process()
+            let mut reader = Self::spawn_emerge_process(progress_bar)
                 .await
                 .expect("failed to spawn emerge process");
             Self::tail_follow(&mut reader, |line| {
@@ -101,7 +102,9 @@ impl BuildWatcher {
         }
     }
 
-    async fn spawn_emerge_process() -> eyre::Result<tokio::sync::broadcast::Sender<String>> {
+    async fn spawn_emerge_process(
+        progress_bar: ProgressBar,
+    ) -> eyre::Result<tokio::sync::broadcast::Sender<String>> {
         let pty_system = native_pty_system();
 
         let pair = pty_system
@@ -132,7 +135,7 @@ impl BuildWatcher {
             let reader = BufReader::new(reader);
             let mut lines = reader.lines();
             while let Some(Ok(line)) = lines.next() {
-                println!("{}", line);
+                progress_bar.println(&line);
                 if tx_clone.send(line).is_err() {
                     println!("Receiver dropped, exiting...");
                     exit(0);
